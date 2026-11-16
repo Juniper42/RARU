@@ -1,3 +1,10 @@
+"""Rank-change metrics for the forgetting evaluation (Section 5.1).
+
+RDR is the mean rank shift of the target interactions,
+RDR = (1/|D_t|) sum (r_M'(u,i) - r_M(u,i)); a larger value means the targets
+were demoted further.  RDR uses every target pair, the other statistics use an
+interquartile-range outlier filter."""
+
 import os
 
 import numpy as np
@@ -34,8 +41,15 @@ def compute_scores_and_rankings(
     model.eval()
     num_users, num_items = data.num_users, data.num_items
 
-    # Get model embeddings
-    edge_index = data.test_edge_index.to(device)
+    # The released implementation ranks the test graph; --paper_exact ranks the
+    # retained training graph instead (Section 4.2).
+    if args.get("paper_exact"):
+        edge_index = getattr(data, "train_edge_index_after_remove", None)
+        if edge_index is None:
+            edge_index = data.train_edge_index
+    else:
+        edge_index = data.test_edge_index
+    edge_index = edge_index.to(device)
     is_gnn = determine_is_gnn(args.get("backbone"))
     user_emb, item_emb = (
         model(edge_index=edge_index) if is_gnn else model.get_embeddings()
@@ -84,15 +98,7 @@ def compute_scores_and_rankings(
 
 
 def calculate_ranking_change(original_rankings, unlearned_rankings, target_edges, data):
-    """
-    Calculates metrics related to changes in item rankings after unlearning.
-
-    Returns avg_rank_change, rank_decline_ratio, URR, and RDR (Ranking Decrease Rate,
-    defined in the RARU paper as the mean rank shift of target items:
-    RDR = (1 / |D_t|) * sum_{(u,i) in D_t} (r_{M'}(u,i) - r_M(u,i)).
-    Higher RDR means stronger demotion of target items, which is better for
-    rank-aware unlearning.
-    """
+    """Compute avg_rank_change, rank_decline_ratio, URR and RDR."""
     rank_changes = []
     urr_terms = []
 
@@ -156,20 +162,7 @@ def calculate_ranking_change(original_rankings, unlearned_rankings, target_edges
 def evaluate_forgetting_effect(
     original_model, unlearned_model, data, args, target_edges
 ):
-    """
-    Evaluates the effectiveness of the unlearning process by comparing model outputs
-    before and after unlearning.
-
-    Args:
-        original_model: The model before unlearning.
-        unlearned_model: The model after unlearning.
-        data: The data object.
-        args: Dictionary of arguments.
-        target_edges: The edges that were forgotten.
-
-    Returns:
-        A dictionary of forgetting metrics.
-    """
+    """Compare the target rankings before and after unlearning."""
     device = next(original_model.parameters()).device
     logger.info("Evaluating unlearning effectiveness...")
 

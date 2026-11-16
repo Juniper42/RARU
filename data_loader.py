@@ -1,8 +1,10 @@
 import gc
+import glob
 import multiprocessing as mp
 import os
 import pickle
 import random
+from array import array
 from functools import partial
 
 import numpy as np
@@ -29,7 +31,8 @@ def set_seed(seed):
         torch.backends.cudnn.benchmark = False
 
 
-def get_cache_path(dataset_name, test_size, val_size=0.1, backbone="lightgcn"):
+def get_cache_path(dataset_name, test_size, val_size=0.1, backbone="lightgcn",
+                   min_rating=3.0, min_interactions=10):
     """
     Gets the cache file path, distinguishing cache directories and paths based on model type.
     """
@@ -45,6 +48,11 @@ def get_cache_path(dataset_name, test_size, val_size=0.1, backbone="lightgcn"):
     cache_dir_name = (
         f"train{train_share:.2f}_val{val_size:.2f}_test{test_size:.2f}_{model_type}"
     )
+    # Only non-default preprocessing is written into the cache name, so the
+    # caches of the released pipeline keep their paths.
+    if min_rating not in (3.0, 3, None) or min_interactions != 10:
+        rating_tag = "all" if min_rating in (0, 0.0, None) else f"{min_rating:g}"
+        cache_dir_name += f"_r{rating_tag}_k{min_interactions}"
     cache_dir_path = os.path.join(f"./data/{dataset_name}/cache/", cache_dir_name)
 
     data_pkl_path = os.path.join(cache_dir_path, "data.pkl")
@@ -140,18 +148,18 @@ def user_random_split(ratings_df, test_size=0.2, val_size=0.1, num_workers=4):
     return train_ratings, val_ratings, test_ratings
 
 
-def _apply_10_core_filter(ratings):
-    """Iteratively applies 10-core filtering to users and items."""
+def _apply_10_core_filter(ratings, min_interactions=10):
+    """Iteratively applies the k-core filter (k = min_interactions)."""
     while True:
         user_counts = ratings["user_id"].value_counts()
         item_counts = ratings["item_id"].value_counts()
 
         initial_rows = len(ratings)
 
-        users_to_keep = user_counts[user_counts >= 10].index
+        users_to_keep = user_counts[user_counts >= min_interactions].index
         ratings = ratings[ratings["user_id"].isin(users_to_keep)]
 
-        items_to_keep = item_counts[item_counts >= 10].index
+        items_to_keep = item_counts[item_counts >= min_interactions].index
         ratings = ratings[ratings["item_id"].isin(items_to_keep)]
 
         if len(ratings) == initial_rows:
@@ -160,22 +168,69 @@ def _apply_10_core_filter(ratings):
     return ratings
 
 
-def load_dataset_raw(dataset_name, data_dir=None):
-    """Loads a raw dataset from its source file."""
+def _load_netflix_ratings(data_dir):
+    """Parse ``combined_data_*.txt`` (``<movie>:`` header, then user,rating,date)."""
+    paths = sorted(glob.glob(os.path.join(data_dir, "combined_data_*.txt")))
+    if not paths:
+        raise FileNotFoundError(
+            f"No combined_data_*.txt found in {data_dir}. Download the Netflix "
+            "Prize dataset and unzip the four files into that directory."
+        )
+
+    user_ids, item_ids, scores = array("i"), array("i"), array("f")
+    for path in paths:
+        current_item = None
+        logger.info(f"Parsing {path} ...")
+        with open(path, "r") as f:
+            for line in f:
+                if line.endswith(":\n"):
+                    current_item = int(line[:-2])
+                    continue
+                if current_item is None:
+                    continue
+                parts = line.split(",")
+                if len(parts) < 2:
+                    continue
+                user_ids.append(int(parts[0]))
+                item_ids.append(current_item)
+                scores.append(float(parts[1]))
+
+    return pd.DataFrame(
+        {
+            "user_id": np.frombuffer(user_ids, dtype=np.int32).copy(),
+            "item_id": np.frombuffer(item_ids, dtype=np.int32).copy(),
+            "rating": np.frombuffer(scores, dtype=np.float32).copy(),
+        }
+    )
+
+
+def load_dataset_raw(dataset_name, data_dir=None, min_rating=3.0,
+                     min_interactions=10):
+    """Load a raw dataset and turn it into implicit interactions.
+
+    ``min_rating`` drops ratings below the threshold, ``min_interactions`` is
+    the k of the k-core filter.  Table 1 counts of the paper are raw dataset
+    statistics."""
     if data_dir is None:
         data_dir = f"./data/{dataset_name}"
 
-    if dataset_name == "ml-1m":
-        rating_file = "ratings.dat"
+    if dataset_name in ("ml-1m", "ml-10m"):
         ratings = pd.read_csv(
-            os.path.join(data_dir, rating_file),
+            os.path.join(data_dir, "ratings.dat"),
             sep="::",
             engine="python",
             header=None,
             names=["user_id", "item_id", "rating", "timestamp"],
         )
-        ratings = ratings[ratings["rating"] >= 3]
-        filtered_ratings = _apply_10_core_filter(ratings)
+        if min_rating is not None and min_rating > 0:
+            ratings = ratings[ratings["rating"] >= min_rating]
+        filtered_ratings = _apply_10_core_filter(ratings, min_interactions)
+
+    elif dataset_name == "netflix":
+        ratings = _load_netflix_ratings(data_dir)
+        if min_rating is not None and min_rating > 0:
+            ratings = ratings[ratings["rating"] >= min_rating]
+        filtered_ratings = _apply_10_core_filter(ratings, min_interactions)
 
     elif dataset_name in ["yelp2018", "amazon-book"]:
         rating_file = "total.txt"
@@ -190,10 +245,13 @@ def load_dataset_raw(dataset_name, data_dir=None):
         ratings = pd.DataFrame(user_items)
         ratings["rating"] = 1
         ratings["timestamp"] = range(len(ratings))
-        filtered_ratings = _apply_10_core_filter(ratings)
+        filtered_ratings = _apply_10_core_filter(ratings, min_interactions)
 
     else:
-        raise ValueError(f"Unsupported dataset: {dataset_name}")
+        raise ValueError(
+            f"Unsupported dataset: {dataset_name}. Supported: ml-1m, ml-10m, "
+            "netflix, yelp2018, amazon-book."
+        )
 
     logger.info("Performing data quality checks...")
     if (
@@ -277,8 +335,12 @@ def load_dataset(dataset_name, device, backbone="lightgcn", **kwargs):
     test_size = kwargs.get("test_size", 0.2)
     val_size = kwargs.get("val_size", 0.0)
     use_cache = kwargs.get("use_cache", True)
+    min_rating = kwargs.get("min_rating", 3.0)
+    min_interactions = kwargs.get("min_interactions", 10)
 
-    cache_info = get_cache_path(dataset_name, test_size, val_size, backbone)
+    cache_info = get_cache_path(dataset_name, test_size, val_size, backbone,
+                                min_rating=min_rating,
+                                min_interactions=min_interactions)
     cache_dir_path = cache_info["cache_dir_path"]
     data_pkl_path = cache_info["data_pkl_path"]
     info_txt_path = cache_info["info_txt_path"]
@@ -304,7 +366,11 @@ def load_dataset(dataset_name, device, backbone="lightgcn", **kwargs):
         f"No cache found or cache is disabled. Processing raw dataset: {dataset_name} for {cache_info['model_type']} model."
     )
 
-    raw_ratings_df = load_dataset_raw(dataset_name)
+    raw_ratings_df = load_dataset_raw(
+        dataset_name,
+        min_rating=min_rating,
+        min_interactions=min_interactions,
+    )
     train_df, val_df, test_df = user_random_split(
         raw_ratings_df, test_size, val_size, num_workers=max(1, mp.cpu_count() // 2)
     )

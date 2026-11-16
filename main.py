@@ -29,27 +29,84 @@ from unlearning_func import (
     unlearnrec_unlearning,
 )
 from unlearning_metrics import evaluate_forgetting_effect
-from utils import get_model
+from utils import determine_is_gnn, get_model
 
 logger = Logger.get_logger("Main")
 
+# --paper_exact switches the RARU semantics and the request construction; it
+# never rewrites the training hyperparameters.
+
+def _sample_target_edges(data, args, device):
+    """Sample the unlearning targets as a fraction of the training interactions."""
+    forward = getattr(data, "train_edge_index_original", None)
+    if forward is None:
+        e = data.train_edge_index
+        forward = e[:, (e[0] < data.num_users) & (e[1] >= data.num_users)]
+    forward = forward.to(device)
+
+    num_edges = forward.size(1)
+    budget = max(1, int(round(float(args["unlearning_ratio"]) * num_edges)))
+    task = args["unlearning_task"]
+
+    if task == "interaction":
+        selected = torch.randperm(num_edges, device=device)[:budget]
+        edges_to_remove = forward[:, selected]
+    else:
+        item_ids = forward[1] - data.num_users
+        counts = torch.bincount(item_ids, minlength=data.num_items).to(torch.long)
+        order = torch.randperm(data.num_items, device=device)
+        cumulative = torch.cumsum(counts[order], dim=0)
+        target = torch.tensor(budget, device=device, dtype=cumulative.dtype)
+        num_items = int(torch.searchsorted(cumulative, target).item()) + 1
+        num_items = min(num_items, data.num_items)
+        removed_items = order[:num_items]
+        data.removed_items = removed_items + data.num_users
+        data.node_type = "item"
+
+        keep_item = torch.ones(data.num_items, dtype=torch.bool, device=device)
+        keep_item[removed_items] = False
+        mask = keep_item[item_ids]
+        edges_to_remove = forward[:, ~mask]
+
+    # Remove both the forward and the backward copies of the targets.
+    keys = torch.sort(
+        edges_to_remove[0].to(torch.long) * data.num_items
+        + (edges_to_remove[1] - data.num_users).to(torch.long)
+    ).values
+    edges = data.train_edge_index.to(device)
+    user_src = edges[0] < data.num_users
+    edge_keys = torch.where(
+        user_src,
+        edges[0].to(torch.long) * data.num_items
+        + (edges[1] - data.num_users).to(torch.long),
+        edges[1].to(torch.long) * data.num_items
+        + (edges[0] - data.num_users).to(torch.long),
+    )
+    keep = ~torch.isin(edge_keys, keys)
+
+    data.edges_to_remove = edges_to_remove
+    data.train_edge_index_after_remove = edges[:, keep]
+    logger.info(
+        f"[request] Removed {edges_to_remove.size(1)} interactions "
+        f"({edges_to_remove.size(1) / max(num_edges, 1):.2%} of the training "
+        f"interactions) for unlearning task '{task}'."
+    )
+    return data
+
 
 def compute_edges_to_remove(data, args, device):
-    """
-    Computes the edges to be removed for the unlearning task.
+    """Compute the edges to remove for the unlearning task.
 
-    Args:
-        data: The data object, which includes graph structure and metadata.
-        args: Configuration arguments, containing unlearning_task, unlearning_ratio, etc.
-        device: The computation device (CPU or CUDA).
-
-    Returns:
-        The updated data object with attributes `edges_to_remove` and
-        `train_edge_index_after_remove` populated.
+    ``--paper_exact`` samples a fraction of the training interactions; the
+    default selects a fraction of the users and then a fraction of each
+    user's interactions.
     """
     logger.info(
         f"Computing edges to remove for unlearning task: {args['unlearning_task']}"
     )
+
+    if args.get("paper_exact", False):
+        return _sample_target_edges(data, args, device)
 
     train_interaction_data = data.train_edge_index
 
@@ -274,8 +331,8 @@ def run_single_experiment(args, run_id=1):
         dataset_name,
         device,
         backbone=args["backbone"],
-        min_rating=3,
-        min_interactions=10,
+        min_rating=args["min_rating"],
+        min_interactions=args["min_interactions"],
         test_size=args["test_size"],
         val_size=args["val_size"],
         split_method=args["split_method"],
@@ -449,6 +506,15 @@ def run_single_experiment(args, run_id=1):
         method_name = "GFEraser"
     else:
         raise ValueError(f"Unknown unlearning method: {args['method']}")
+
+    # Under --paper_exact the targets are gone from the graph, so the model is
+    # evaluated on D_r.
+    if args.get("paper_exact", False) and determine_is_gnn(args["backbone"]):
+        data.train_edge_index = data.train_edge_index_after_remove
+        logger.info(
+            "[request] Evaluation graph switched to D_r "
+            f"({data.train_edge_index.size(1)} directed edges)."
+        )
 
     # Evaluate the unlearned model
     logger.info(f"\nEvaluating the {method_name} model...")

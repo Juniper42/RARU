@@ -80,10 +80,26 @@ class Config:
             help="Whether to evaluate the forgetting effect.",
         )
         parser.add_argument(
+            "--min_rating",
+            type=float,
+            default=3.0,
+            help="Ratings below this value are dropped when interactions are "
+                 "turned into implicit feedback. Set it to 0 to keep every "
+                 "rating, as described in Section 5.1 of the paper.",
+        )
+        parser.add_argument(
+            "--min_interactions",
+            type=int,
+            default=10,
+            help="k-core threshold applied iteratively to users and items.",
+        )
+        parser.add_argument(
             "--split_method",
             type=str,
             default="temporal",
-            help="Dataset splitting method (e.g., temporal).",
+            help="Accepted for compatibility. data_loader.user_random_split "
+                 "produces a per-user random split with a fixed seed, so this "
+                 "flag does not change the split that is used.",
         )
         parser.add_argument(
             "--k", type=int, default=10, help="Size of the recommendation list (top-k)."
@@ -245,7 +261,9 @@ class Config:
             "--unlearning_ratio",
             type=float,
             default=0.1,
-            help="Proportion of users or items to be unlearned.",
+            help="Size of the unlearning request. Default 'interaction': "
+                 "fraction of the users; with --paper_exact: fraction of the "
+                 "training interactions; 'item': fraction of the items.",
         )
         parser.add_argument(
             "--unlearning_task",
@@ -258,7 +276,8 @@ class Config:
             "--unlearning_interaction_ratio",
             type=float,
             default=0.2,
-            help="Proportion of a user's interactions to remove in 'interaction' unlearning.",
+            help="Fraction of a user's interactions removed by the default "
+                 "'interaction' request.",
         )
 
         # General parameters that might be used by multiple methods
@@ -463,57 +482,69 @@ class Config:
             help="Training mode for CertifiedRemoval: 'ovr' (One-vs-Rest) or 'binary'.",
         )
 
-        # RARU Parameters (paper Section 4 / Section 5.1.6).
+        # RARU: SGSL scope (Section 4.1) + SWRU update (Section 4.2).
+        parser.add_argument(
+            "--paper_exact", type=str2bool, nargs="?", const=True, default=False,
+            help="Paper semantics: both endpoints in V_t, no scope cap, "
+                 "Gauss-Newton Eqs. (13)-(14), full C_u of Eq. (12), shared "
+                 "negatives. Off keeps the released implementation.",
+        )
         parser.add_argument(
             "--scope_cutoff_k",
             type=int,
             default=10,
-            help="Scope cutoff k that defines the rank-adaptive expansion "
-                 "threshold tau = S_max / k (Eq. 5).",
+            help="Scope cutoff k: tau = S_max / k (Eq. 8) and the C_u window "
+                 "(Eq. 12).",
         )
         parser.add_argument(
             "--damping_lambda",
             type=float,
             default=1e-2,
-            help="Damping coefficient lambda in (H + P_S + lambda I) Delta = g_t (Eq. 9).",
+            help="Damping lambda in Eq. (16).",
         )
         parser.add_argument(
             "--cg_steps",
             type=int,
             default=30,
-            help="Number of conjugate-gradient iterations T for solving Eq. 10.",
+            help="Conjugate-gradient iterations T of Eq. (16).",
         )
         parser.add_argument(
             "--rarl_max_scope_size",
             type=int,
             default=5000,
-            help="Hard cap on |V_S| during the LRAS expansion to bound memory.",
+            help="Cap on |V_S| for the default path; disabled under --paper_exact.",
         )
 
-        # RARU ablation switches (Table 4 of the paper).
+        # RARU ablation switches (Table 4).
         parser.add_argument(
-            "--rarl_no_sconn", type=str2bool, default=False,
-            help="Ablation: drop the connectivity salience S_conn (Eq. 1).",
+            "--raru_no_sconn", "--rarl_no_sconn", dest="raru_no_sconn",
+            type=str2bool, nargs="?", const=True, default=False,
+            help="Ablation: drop the connectivity salience S_conn (Eq. 5).",
         )
         parser.add_argument(
-            "--rarl_no_sim", type=str2bool, default=False,
-            help="Ablation: drop the similarity salience S_sim (Eq. 2).",
+            "--raru_no_sim", "--rarl_no_sim", dest="raru_no_sim",
+            type=str2bool, nargs="?", const=True, default=False,
+            help="Ablation: drop the similarity salience S_sim (Eq. 6).",
         )
         parser.add_argument(
-            "--rarl_no_localized", type=str2bool, default=False,
-            help="Ablation: skip the LRAS BFS expansion and use the full D_r.",
+            "--raru_no_localized", "--rarl_no_localized", dest="raru_no_localized",
+            type=str2bool, nargs="?", const=True, default=False,
+            help="Ablation: skip the SGSL expansion and use all of D_r.",
         )
         parser.add_argument(
-            "--rarl_no_salience_weight", type=str2bool, default=False,
-            help="Ablation: set S_ui = 1 (uniform weighting inside P_S).",
+            "--raru_no_salience_weight", "--rarl_no_salience_weight",
+            dest="raru_no_salience_weight", type=str2bool, nargs="?", const=True, default=False,
+            help="Ablation: set S_ui = 1 inside P_S and H_tilde.",
         )
         parser.add_argument(
-            "--rarl_no_margin", type=str2bool, default=False,
+            "--raru_no_margin", "--rarl_no_margin", dest="raru_no_margin",
+            type=str2bool, nargs="?", const=True, default=False,
             help="Ablation: drop the preservation matrix P_S entirely.",
         )
         parser.add_argument(
-            "--rarl_no_curvature", type=str2bool, default=False,
-            help="Ablation: replace H_tilde with identity (first-order update).",
+            "--raru_no_curvature", "--rarl_no_curvature", dest="raru_no_curvature",
+            type=str2bool, nargs="?", const=True, default=False,
+            help="Ablation: drop H_tilde and keep the first-order term.",
         )
 
         # UltraRE Parameters

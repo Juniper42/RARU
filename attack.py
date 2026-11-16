@@ -22,9 +22,11 @@ logger = Logger.get_logger("MIAttack")
 
 
 class MembershipInferenceAttack:
-    """
-    Implements a black-box Membership Inference Attack (MIA) to evaluate privacy leakage.
-    """
+    """Black-box membership inference attack used for the MI-AUC metric.
+
+    Members are the target interactions, non-members are user-item pairs that
+    never appear in the training data.  The AUC stays near 0.5 when the two
+    score distributions are hard to tell apart."""
 
     def __init__(self, original_model, unlearning_model, data, device, args):
         self.original_model = original_model
